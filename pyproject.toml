@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 
 [project.scripts]
 zimage-distill-pairs = "zimage_distill.teacher_pairs:main"
+zimage-distill-infer = "zimage_distill.infer:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
