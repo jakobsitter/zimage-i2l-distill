@@ -8,5 +8,8 @@ version = "0.1.0"
 description = "Bootstrap repository for zimage image-to-LoRA distillation work"
 requires-python = ">=3.10"
 
+[project.scripts]
+zimage-distill-pairs = "zimage_distill.teacher_pairs:main"
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
