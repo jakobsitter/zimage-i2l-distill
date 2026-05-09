@@ -9,6 +9,8 @@ MOBILENET_SMALL_FEATURES = 576
 
 
 class StudentImageEncoder(nn.Module):
+    backbone_name = "mobilenet_v3_small"
+
     def __init__(self, embedding_dim: int = TEACHER_EMBEDDING_DIM):
         super().__init__()
         backbone = mobilenet_v3_small(weights=None)
