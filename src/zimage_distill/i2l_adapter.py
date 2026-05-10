@@ -20,13 +20,23 @@ def resolve_decoder_checkpoint(path: Path | str | None) -> Path:
     return Path(cfg.path)
 
 
+def _detect_compress_dim(state_dict: dict) -> int:
+    # proj_a.proj_in.weight has shape [compress_dim, 5632]
+    for key, value in state_dict.items():
+        if "proj_a.proj_in.weight" in key:
+            return value.shape[0]
+    return 64  # default fallback
+
+
 class I2LDecoderAdapter:
     def __init__(self, checkpoint_path: Path | str | None = None, device: torch.device | str = "cpu"):
         self.device = torch.device(device)
         resolved = resolve_decoder_checkpoint(checkpoint_path)
         print(f"Loading i2L decoder from: {resolved}")
-        self.decoder = ZImageImage2LoRAModel()
         state_dict = load_file(str(resolved), device="cpu")
+        compress_dim = _detect_compress_dim(state_dict)
+        print(f"  compress_dim={compress_dim}")
+        self.decoder = ZImageImage2LoRAModel(compress_dim=compress_dim)
         self.decoder.load_state_dict(state_dict)
         self.decoder.to(self.device)
         self.decoder.eval()
