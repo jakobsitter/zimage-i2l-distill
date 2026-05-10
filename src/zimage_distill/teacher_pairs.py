@@ -34,6 +34,7 @@ DEFAULT_DINOV3_PATH = Path(
         str(DEFAULT_MODEL_ROOT / "DINOv3-7B" / "model.safetensors"),
     )
 )
+ENCODER_HF_REPO = "DiffSynth-Studio/General-Image-Encoders"
 
 
 @dataclass(frozen=True)
@@ -54,25 +55,32 @@ class TeacherEncoderBundle:
     )
 
     def encode_images(self, images: Sequence[Image.Image]) -> torch.Tensor:
-        embeddings: list[torch.Tensor] = []
-        for image in images:
-            image = self.preprocess(image)
-            siglip_embedding = self.siglip2_image_encoder(
-                image,
-                torch_dtype=self.torch_dtype,
-                device=self.device,
-            )
-            dino_embedding = self.dinov3_image_encoder(
-                image,
-                torch_dtype=self.torch_dtype,
-                device=self.device,
-            )
-            embeddings.append(
-                torch.cat([siglip_embedding, dino_embedding], dim=-1)
-                .squeeze(0)
-                .to(dtype=self.torch_dtype)
-            )
-        return torch.stack(embeddings)
+        preprocessed = [self.preprocess(image) for image in images]
+
+        self.siglip2_image_encoder.to(self.device)
+        with torch.no_grad():
+            siglip_embeddings = [
+                self.siglip2_image_encoder(img, torch_dtype=self.torch_dtype, device=self.device)
+                for img in preprocessed
+            ]
+        self.siglip2_image_encoder.to("cpu")
+        if str(self.device).startswith("cuda"):
+            torch.cuda.empty_cache()
+
+        self.dinov3_image_encoder.to(self.device)
+        with torch.no_grad():
+            dino_embeddings = [
+                self.dinov3_image_encoder(img, torch_dtype=self.torch_dtype, device=self.device)
+                for img in preprocessed
+            ]
+        self.dinov3_image_encoder.to("cpu")
+        if str(self.device).startswith("cuda"):
+            torch.cuda.empty_cache()
+
+        return torch.stack([
+            torch.cat([s, d], dim=-1).squeeze(0).to(dtype=self.torch_dtype)
+            for s, d in zip(siglip_embeddings, dino_embeddings)
+        ])
 
 
 def save_teacher_sample(sample: TeacherSample, out_dir: Path) -> None:
@@ -109,10 +117,16 @@ def load_teacher_sample(out_dir: Path) -> TeacherSample:
     )
 
 
+def _model_config_for(local_path: Path, hf_pattern: str) -> ModelConfig:
+    if local_path.exists():
+        return ModelConfig(path=str(local_path))
+    return ModelConfig(model_id=ENCODER_HF_REPO, origin_file_pattern=hf_pattern)
+
+
 def build_teacher_model_configs(siglip2_path: Path, dinov3_path: Path) -> list[ModelConfig]:
     return [
-        ModelConfig(path=str(siglip2_path)),
-        ModelConfig(path=str(dinov3_path)),
+        _model_config_for(siglip2_path, "SigLIP2-G384/model.safetensors"),
+        _model_config_for(dinov3_path, "DINOv3-7B/model.safetensors"),
     ]
 
 
@@ -123,7 +137,9 @@ def load_teacher_encoder_bundle(
     device: str | torch.device,
     torch_dtype: torch.dtype,
 ) -> TeacherEncoderBundle:
-    loader = BasePipeline(device=device, torch_dtype=torch_dtype)
+    # Load both models onto CPU so they don't both occupy GPU at once.
+    # encode_images moves each model to `device` only during its forward pass.
+    loader = BasePipeline(device="cpu", torch_dtype=torch_dtype)
     model_pool = loader.download_and_load_models(build_teacher_model_configs(siglip2_path, dinov3_path))
 
     siglip2_image_encoder = model_pool.fetch_model("siglip2_image_encoder")
@@ -185,17 +201,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory where teacher pairs are written.",
     )
     parser.add_argument(
+        "--refs-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root directory containing subject sub-folders. Each sub-folder "
+            "is treated as one sample; its images become the reference images "
+            "and the folder name becomes the sample name. Mutually exclusive "
+            "with --image-path / --sample-name."
+        ),
+    )
+    parser.add_argument(
         "--sample-name",
         type=str,
         default="sample_0001",
-        help="Folder name for the teacher sample.",
+        help="Folder name for the teacher sample (single-sample mode).",
     )
     parser.add_argument(
         "--image-path",
         action="append",
         default=[],
         type=Path,
-        help="Reference image path. May be repeated.",
+        help="Reference image path. May be repeated (single-sample mode).",
     )
     parser.add_argument(
         "--metadata-json",
@@ -235,26 +262,59 @@ def _parse_torch_dtype(name: str) -> torch.dtype:
     return getattr(torch, name)
 
 
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def _collect_subject_folders(refs_root: Path) -> list[Path]:
+    return sorted(p for p in refs_root.iterdir() if p.is_dir())
+
+
+def _images_in_folder(folder: Path) -> list[Path]:
+    return sorted(p for p in folder.iterdir() if p.suffix.lower() in _IMAGE_SUFFIXES)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if not args.image_path:
-        parser.error("at least one --image-path is required")
+    if args.refs_root and args.image_path:
+        parser.error("--refs-root and --image-path are mutually exclusive")
 
     output_dir = args.output_dir
     if not output_dir.is_absolute():
         output_dir = args.repo_root / output_dir
 
     metadata = json.loads(args.metadata_json)
+    torch_dtype = _parse_torch_dtype(args.torch_dtype)
+
     bundle = load_teacher_encoder_bundle(
         args.siglip2_path,
         args.dinov3_path,
         device=args.device,
-        torch_dtype=_parse_torch_dtype(args.torch_dtype),
+        torch_dtype=torch_dtype,
     )
-    sample = build_teacher_sample(args.image_path, bundle, metadata)
-    save_teacher_sample(sample, output_dir / args.sample_name)
+
+    if args.refs_root:
+        refs_root = args.refs_root
+        if not refs_root.is_absolute():
+            refs_root = args.repo_root / refs_root
+        subject_folders = _collect_subject_folders(refs_root)
+        if not subject_folders:
+            parser.error(f"no sub-folders found under --refs-root {refs_root}")
+        for folder in subject_folders:
+            image_paths = _images_in_folder(folder)
+            if not image_paths:
+                print(f"skipping {folder.name}: no images found")
+                continue
+            print(f"processing {folder.name} ({len(image_paths)} images)…")
+            sample = build_teacher_sample(image_paths, bundle, {**metadata, "subject": folder.name})
+            save_teacher_sample(sample, output_dir / folder.name)
+    else:
+        if not args.image_path:
+            parser.error("at least one --image-path is required (or use --refs-root)")
+        sample = build_teacher_sample(args.image_path, bundle, metadata)
+        save_teacher_sample(sample, output_dir / args.sample_name)
+
     return 0
 
 
