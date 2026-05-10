@@ -31,15 +31,33 @@ class _MobileNetBackbone(nn.Module):
         return self.net(x)
 
 
+def _load_vision_model(model_id: str):
+    from transformers import AutoModel
+    model = AutoModel.from_pretrained(model_id)
+    # Full vision-language models (e.g. SiglipModel) wrap the vision encoder
+    # under .vision_model; extract it so we get a clean vision-only module.
+    if hasattr(model, "vision_model"):
+        model = model.vision_model
+    return model
+
+
+def _hidden_size(model) -> int:
+    cfg = model.config
+    if hasattr(cfg, "hidden_size"):
+        return cfg.hidden_size
+    if hasattr(cfg, "vision_config"):
+        return cfg.vision_config.hidden_size
+    raise AttributeError(f"Cannot determine hidden_size from {type(cfg)}")
+
+
 class _HFViTBackbone(nn.Module):
     def __init__(self, model_id: str, norm_mean: list[float], norm_std: list[float], freeze: bool = False) -> None:
         super().__init__()
-        from transformers import AutoModel
-        self.model = AutoModel.from_pretrained(model_id)
+        self.model = _load_vision_model(model_id)
         if freeze:
             for p in self.model.parameters():
                 p.requires_grad_(False)
-        self.out_dim: int = self.model.config.hidden_size
+        self.out_dim: int = _hidden_size(self.model)
         self.register_buffer("mean", torch.tensor(norm_mean).view(1, 3, 1, 1))
         self.register_buffer("std",  torch.tensor(norm_std).view(1, 3, 1, 1))
 
@@ -60,13 +78,12 @@ class _DualHFViTBackbone(nn.Module):
         freeze: bool = True,
     ) -> None:
         super().__init__()
-        from transformers import AutoModel
-        self.model_a = AutoModel.from_pretrained(model_id_a)
-        self.model_b = AutoModel.from_pretrained(model_id_b)
+        self.model_a = _load_vision_model(model_id_a)
+        self.model_b = _load_vision_model(model_id_b)
         if freeze:
             for p in list(self.model_a.parameters()) + list(self.model_b.parameters()):
                 p.requires_grad_(False)
-        self.out_dim: int = self.model_a.config.hidden_size + self.model_b.config.hidden_size
+        self.out_dim: int = _hidden_size(self.model_a) + _hidden_size(self.model_b)
         self.register_buffer("mean_a", torch.tensor(norm_mean_a).view(1, 3, 1, 1))
         self.register_buffer("std_a",  torch.tensor(norm_std_a).view(1, 3, 1, 1))
         self.register_buffer("mean_b", torch.tensor(norm_mean_b).view(1, 3, 1, 1))
