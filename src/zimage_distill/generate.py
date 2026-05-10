@@ -97,6 +97,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--lora", type=Path,
         help="Pre-computed LoRA safetensors file. Skips student and i2L steps.",
     )
+    src.add_argument(
+        "--no-lora", action="store_true",
+        help="Generate with no LoRA at all. Useful for checking the base pipeline.",
+    )
 
     parser.add_argument("--prompt", required=True, help="Text prompt for generation.")
     parser.add_argument("--output", required=True, type=Path, help="Output image path.")
@@ -119,7 +123,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.reference_images and args.student_checkpoint is None:
         build_parser().error("--student-checkpoint is required when using --reference-image")
 
-    if args.lora:
+    if args.no_lora:
+        print("Generating with no LoRA (base pipeline check).")
+        lora = None
+    elif args.lora:
         print(f"Loading LoRA from {args.lora}")
         lora = lora_from_file(args.lora)
     else:
