@@ -37,7 +37,8 @@ def emit_lora(student_embedding: torch.Tensor, decoder: I2LDecoderAdapter, out_p
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local zimage image-to-LoRA inference path")
     parser.add_argument("--student-checkpoint", required=True, type=Path)
-    parser.add_argument("--decoder-checkpoint", required=True, type=Path)
+    parser.add_argument("--decoder-checkpoint", default=None, type=Path,
+                        help="Path to Z-Image i2L decoder weights. Auto-downloads from ModelScope if omitted.")
     parser.add_argument("--reference-image", action="append", dest="reference_images", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
