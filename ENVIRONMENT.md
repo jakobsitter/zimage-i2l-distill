@@ -173,6 +173,66 @@ The pipeline works around this by:
 
 ---
 
+## Student training
+
+The student encoder distills SigLIP2-G384 + DINOv3-7B into a lightweight
+model that can be used at inference time without loading the teacher weights.
+
+### Available backbones
+
+| `--backbone` | Architecture | Trainable params | Notes |
+|---|---|---|---|
+| `mobilenet_v3_small` | MobileNetV3-Small (ImageNet) | 4.2M | Fast baseline |
+| `dinov3-vitb16` | DINOv3 ViT-B/16 (86M) | 86M + head | Best single backbone; distilled from same DINOv3-7B teacher |
+| `dinov3-vits16` | DINOv3 ViT-S/16 (21M) | 21M + head | Fastest ViT option |
+| `dual-dinov3s-siglip2b` | DINOv3-S + SigLIP2-B frozen, projection only | ~6.5M | Mirrors two-teacher structure; backbones frozen |
+
+HuggingFace weights download automatically on first run (~80–330 MB per model).
+
+### Running training
+
+```bash
+# Baseline
+python -m zimage_distill.train --backbone mobilenet_v3_small --epochs 10
+
+# DINOv3-ViT-B/16 — recommended single backbone
+python -m zimage_distill.train --backbone dinov3-vitb16 --epochs 10
+
+# DINOv3-ViT-S/16 — fastest
+python -m zimage_distill.train --backbone dinov3-vits16 --epochs 10
+
+# Dual (frozen backbones, projection head only — more epochs needed)
+python -m zimage_distill.train --backbone dual-dinov3s-siglip2b --epochs 30 --lr 5e-4
+```
+
+Each backbone writes its own checkpoint so runs don't overwrite each other:
+
+```
+checkpoints/
+  student_mobilenet_v3_small.pt
+  student_dinov3-vitb16.pt
+  student_dinov3-vits16.pt
+  student_dual-dinov3s-siglip2b.pt
+```
+
+### Why these backbones
+
+The teacher target is a 5632-dim concatenation of SigLIP2-G384 (1536-dim,
+vision-language aligned) and DINOv3-7B (4096-dim, self-supervised structural).
+
+`dinov3-vitb16` was literally distilled from the same DINOv3-7B teacher that
+produces half the target — it is already in the right representation space.
+`dual-dinov3s-siglip2b` mirrors the two-teacher architecture directly: one
+sub-backbone per teacher family, concatenated and projected. Both backbones
+are frozen and only the 6.5M-param projection head trains, which suits the
+~1K sample dataset size.
+
+`mobilenet_v3_small` is the weakest architecturally (ImageNet classification
+features, 576-dim projected up to 5632) but trains in ~1 minute and is useful
+as a sanity-check baseline.
+
+---
+
 ## Quick sanity check
 
 ```bash
@@ -187,5 +247,7 @@ print('transformers:', transformers.__version__)
 from diffsynth.models.siglip2_image_encoder import Siglip2ImageEncoder
 from diffsynth.models.dinov3_image_encoder import DINOv3ImageEncoder
 print('DiffSynth encoder imports: OK')
+from zimage_distill.student import BACKBONE_CONFIGS
+print('Student backbones:', list(BACKBONE_CONFIGS))
 "
 ```

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -8,14 +9,17 @@ from torch import nn
 from torch.utils.data import Dataset
 
 from .paths import checkpoints_dir, data_dir
-from .student import StudentImageEncoder
+from .student import BACKBONE_CONFIGS, StudentImageEncoder, TEACHER_EMBEDDING_DIM
 from .dataset import TeacherEmbeddingDataset
 
-BACKBONE_NAME = StudentImageEncoder.backbone_name
-DEFAULT_EPOCHS = 2
+DEFAULT_BACKBONE = "mobilenet_v3_small"
+DEFAULT_EPOCHS = 10
 DEFAULT_LEARNING_RATE = 1e-3
-CHECKPOINT_FILENAME = "student.pt"
 MANIFEST_FILENAME = "student_manifest.json"
+
+
+def checkpoint_path_for(backbone: str, output_dir: Path) -> Path:
+    return output_dir / f"student_{backbone}.pt"
 
 
 def train_step(model: nn.Module, optimizer: torch.optim.Optimizer, images: torch.Tensor, target: torch.Tensor) -> float:
@@ -23,10 +27,9 @@ def train_step(model: nn.Module, optimizer: torch.optim.Optimizer, images: torch
     device = next(model.parameters()).device
     images = images.to(device)
     target = target.to(device)
-
     optimizer.zero_grad()
     prediction = model(images)
-    loss = torch.nn.functional.mse_loss(prediction, target)
+    loss = torch.nn.functional.mse_loss(prediction, target.to(prediction))
     loss.backward()
     optimizer.step()
     return float(loss.item())
@@ -38,7 +41,7 @@ def save_checkpoint(model: StudentImageEncoder, path: Path) -> None:
     torch.save(
         {
             "state_dict": model.state_dict(),
-            "backbone_name": getattr(model, "backbone_name", BACKBONE_NAME),
+            "backbone_name": model.backbone_name,
             "embedding_dim": model.head.out_features,
         },
         path,
@@ -46,45 +49,107 @@ def save_checkpoint(model: StudentImageEncoder, path: Path) -> None:
 
 
 def load_checkpoint(path: Path) -> StudentImageEncoder:
-    checkpoint = torch.load(Path(path), map_location="cpu")
-    if checkpoint["backbone_name"] != BACKBONE_NAME:
-        raise ValueError(f"Unsupported backbone: {checkpoint['backbone_name']}")
-
-    model = StudentImageEncoder(embedding_dim=int(checkpoint["embedding_dim"]))
+    checkpoint = torch.load(Path(path), map_location="cpu", weights_only=False)
+    model = StudentImageEncoder(
+        backbone=checkpoint["backbone_name"],
+        embedding_dim=int(checkpoint["embedding_dim"]),
+    )
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
     return model
 
 
-def _train_model(dataset: Dataset[dict[str, torch.Tensor]]) -> StudentImageEncoder:
-    model = StudentImageEncoder()
-    optimizer = torch.optim.Adam(model.parameters(), lr=DEFAULT_LEARNING_RATE)
+def _train_model(
+    dataset: Dataset,
+    backbone: str,
+    epochs: int,
+    lr: float,
+) -> StudentImageEncoder:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"backbone={backbone}  device={device}  samples={len(dataset)}  epochs={epochs}  lr={lr}")
 
-    for _ in range(DEFAULT_EPOCHS):
-        for sample in dataset:
-            train_step(model, optimizer, sample["images"], sample["target"])
+    model = StudentImageEncoder(backbone=backbone).to(device)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"params: {trainable:,} trainable / {total:,} total")
+
+    optimizer = torch.optim.Adam(
+        (p for p in model.parameters() if p.requires_grad), lr=lr
+    )
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for i, sample in enumerate(dataset):
+            loss = train_step(model, optimizer, sample["images"], sample["target"])
+            total_loss += loss
+            if (i + 1) % 100 == 0:
+                print(f"  epoch {epoch + 1}/{epochs}  step {i + 1}/{len(dataset)}  avg_loss {total_loss / (i + 1):.4f}")
+        print(f"epoch {epoch + 1}/{epochs} done  avg_loss {total_loss / len(dataset):.4f}")
 
     return model
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="zimage-distill-train", description="Train a student encoder.")
+    parser.add_argument(
+        "--backbone",
+        choices=list(BACKBONE_CONFIGS),
+        default=DEFAULT_BACKBONE,
+        help=f"Backbone architecture. Default: {DEFAULT_BACKBONE}",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=DEFAULT_EPOCHS,
+        help=f"Training epochs. Default: {DEFAULT_EPOCHS}",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=DEFAULT_LEARNING_RATE,
+        help=f"Learning rate. Default: {DEFAULT_LEARNING_RATE}",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Path to teacher_pairs directory. Defaults to repo data/teacher_pairs.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Where to write checkpoints. Defaults to repo checkpoints/.",
+    )
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
-    _ = argv
-    training_data_path = data_dir() / "teacher_pairs"
-    output_dir = checkpoints_dir()
+    args = build_parser().parse_args(argv)
+
+    training_data_path = args.data_dir or (data_dir() / "teacher_pairs")
+    output_dir = args.output_dir or checkpoints_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"Loading dataset from {training_data_path}")
     dataset = TeacherEmbeddingDataset(training_data_path)
-    model = _train_model(dataset)
 
-    checkpoint_path = output_dir / CHECKPOINT_FILENAME
-    save_checkpoint(model, checkpoint_path)
+    model = _train_model(dataset, backbone=args.backbone, epochs=args.epochs, lr=args.lr)
+
+    ckpt_path = checkpoint_path_for(args.backbone, output_dir)
+    save_checkpoint(model, ckpt_path)
+    print(f"Saved checkpoint: {ckpt_path}")
 
     manifest = {
-        "backbone_name": BACKBONE_NAME,
+        "backbone_name": args.backbone,
         "embedding_dim": model.head.out_features,
         "training_data_path": str(training_data_path),
+        "epochs": args.epochs,
+        "lr": args.lr,
     }
-    (output_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest_path = output_dir / f"student_{args.backbone}_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Saved manifest:    {manifest_path}")
     return 0
 
 
