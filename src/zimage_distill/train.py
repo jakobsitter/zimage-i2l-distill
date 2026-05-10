@@ -22,6 +22,13 @@ def checkpoint_path_for(backbone: str, output_dir: Path) -> Path:
     return output_dir / f"student_{backbone}.pt"
 
 
+def distillation_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    target = target.to(prediction)
+    cos_loss = (1 - torch.nn.functional.cosine_similarity(prediction, target, dim=-1)).mean()
+    mse_loss = torch.nn.functional.mse_loss(prediction, target)
+    return cos_loss + 0.1 * mse_loss
+
+
 def train_step(model: nn.Module, optimizer: torch.optim.Optimizer, images: torch.Tensor, target: torch.Tensor) -> float:
     model.train()
     device = next(model.parameters()).device
@@ -29,7 +36,7 @@ def train_step(model: nn.Module, optimizer: torch.optim.Optimizer, images: torch
     target = target.to(device)
     optimizer.zero_grad()
     prediction = model(images)
-    loss = torch.nn.functional.mse_loss(prediction, target.to(prediction))
+    loss = distillation_loss(prediction, target)
     loss.backward()
     optimizer.step()
     return float(loss.item())
@@ -111,7 +118,7 @@ def _train_model(
                 target = targets[idx].to(device)
                 optimizer.zero_grad()
                 prediction = model.head(feat)
-                loss = torch.nn.functional.mse_loss(prediction, target.to(prediction))
+                loss = distillation_loss(prediction, target)
                 loss.backward()
                 optimizer.step()
                 total_loss += float(loss.item())

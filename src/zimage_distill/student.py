@@ -160,7 +160,12 @@ class StudentImageEncoder(nn.Module):
         super().__init__()
         self.backbone_name = backbone
         self.encoder = _build_backbone(backbone)
-        self.head = nn.Linear(self.encoder.out_dim, embedding_dim)
+        hidden = max(self.encoder.out_dim * 2, 2048)
+        self.head = nn.Sequential(
+            nn.Linear(self.encoder.out_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, embedding_dim),
+        )
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         if images.dim() == 4:
