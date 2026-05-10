@@ -59,6 +59,28 @@ def load_checkpoint(path: Path) -> StudentImageEncoder:
     return model
 
 
+def _is_frozen_backbone(backbone: str) -> bool:
+    cfg = BACKBONE_CONFIGS.get(backbone, {})
+    return cfg.get("kwargs", {}).get("freeze", False)
+
+
+def _cache_backbone_features(model: StudentImageEncoder, dataset: Dataset, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-compute frozen backbone features once so epochs only train the head."""
+    print("Pre-computing backbone features (one-time)...")
+    model.eval()
+    all_features, all_targets = [], []
+    with torch.no_grad():
+        for i, sample in enumerate(dataset):
+            images = sample["images"].to(device)
+            features = model.encoder(images.unsqueeze(0) if images.dim() == 3 else images)
+            all_features.append(features.mean(dim=0).cpu())
+            all_targets.append(sample["target"].cpu())
+            if (i + 1) % 100 == 0:
+                print(f"  cached {i + 1}/{len(dataset)}")
+    print(f"Feature cache ready: {len(all_features)} samples")
+    return torch.stack(all_features), torch.stack(all_targets)
+
+
 def _train_model(
     dataset: Dataset,
     backbone: str,
@@ -77,14 +99,32 @@ def _train_model(
         (p for p in model.parameters() if p.requires_grad), lr=lr
     )
 
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for i, sample in enumerate(dataset):
-            loss = train_step(model, optimizer, sample["images"], sample["target"])
-            total_loss += loss
-            if (i + 1) % 100 == 0:
-                print(f"  epoch {epoch + 1}/{epochs}  step {i + 1}/{len(dataset)}  avg_loss {total_loss / (i + 1):.4f}")
-        print(f"epoch {epoch + 1}/{epochs} done  avg_loss {total_loss / len(dataset):.4f}")
+    # For frozen backbones, pre-compute features once and train only the head.
+    if _is_frozen_backbone(backbone):
+        features, targets = _cache_backbone_features(model, dataset, device)
+        for epoch in range(epochs):
+            model.train()
+            perm = torch.randperm(len(features))
+            total_loss = 0.0
+            for i, idx in enumerate(perm):
+                feat = features[idx].to(device)
+                target = targets[idx].to(device)
+                optimizer.zero_grad()
+                prediction = model.head(feat)
+                loss = torch.nn.functional.mse_loss(prediction, target.to(prediction))
+                loss.backward()
+                optimizer.step()
+                total_loss += float(loss.item())
+            print(f"epoch {epoch + 1}/{epochs} done  avg_loss {total_loss / len(features):.4f}")
+    else:
+        for epoch in range(epochs):
+            total_loss = 0.0
+            for i, sample in enumerate(dataset):
+                loss = train_step(model, optimizer, sample["images"], sample["target"])
+                total_loss += loss
+                if (i + 1) % 100 == 0:
+                    print(f"  epoch {epoch + 1}/{epochs}  step {i + 1}/{len(dataset)}  avg_loss {total_loss / (i + 1):.4f}")
+            print(f"epoch {epoch + 1}/{epochs} done  avg_loss {total_loss / len(dataset):.4f}")
 
     return model
 
