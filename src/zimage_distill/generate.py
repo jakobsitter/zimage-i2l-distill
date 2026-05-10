@@ -122,9 +122,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--sigma-shift", type=float, default=8.0)
-    parser.add_argument("--lora-scale", type=float, default=1.0,
+    parser.add_argument("--lora-scale", type=float, default=2.0,
                         help="Scale factor applied to LoRA weights before generation. "
-                             "Try 2–4 if style influence is too subtle.")
+                             "Default 2.0 matches the i2L decoder's calibration. "
+                             "Higher values increase style strength; above ~3.5 produces noise.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser
 
