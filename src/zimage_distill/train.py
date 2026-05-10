@@ -49,7 +49,7 @@ def save_checkpoint(model: StudentImageEncoder, path: Path) -> None:
         {
             "state_dict": model.state_dict(),
             "backbone_name": model.backbone_name,
-            "embedding_dim": model.head.out_features,
+            "embedding_dim": model.head[-1].out_features,
         },
         path,
     )
@@ -189,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = {
         "backbone_name": args.backbone,
-        "embedding_dim": model.head.out_features,
+        "embedding_dim": model.head[-1].out_features,
         "training_data_path": str(training_data_path),
         "epochs": args.epochs,
         "lr": args.lr,
