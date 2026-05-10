@@ -1,4 +1,4 @@
 [submodule "vendor/DiffSynth-Studio"]
 	path = vendor/DiffSynth-Studio
-	url = https://github.com/modelscope/DiffSynth-Studio.git
-	branch = main
+	url = https://github.com/jakobsitter/DiffSynth-Studio.git
+	branch = fix/teacher-pair-generation-pipeline
