@@ -122,6 +122,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--sigma-shift", type=float, default=8.0)
+    parser.add_argument("--lora-scale", type=float, default=1.0,
+                        help="Scale factor applied to LoRA weights before generation. "
+                             "Try 2–4 if style influence is too subtle.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser
 
@@ -146,6 +149,10 @@ def main(argv: list[str] | None = None) -> int:
             args.reference_images,
             args.device,
         )
+
+    if lora is not None and args.lora_scale != 1.0:
+        print(f"Applying lora-scale={args.lora_scale}")
+        lora = {k: v * args.lora_scale for k, v in lora.items()}
 
     pipe = load_generation_pipeline(args.device)
 
