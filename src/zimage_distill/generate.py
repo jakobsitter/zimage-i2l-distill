@@ -19,19 +19,28 @@ DEFAULT_NEGATIVE_PROMPT = (
     "噪点，网格感，JPEG压缩条纹，异常的肢体，水印，乱码，意义不明的字符"
 )
 
-Z_IMAGE_MODELS = [
-    ("Tongyi-MAI/Z-Image",       "transformer/*.safetensors"),
-    ("Tongyi-MAI/Z-Image-Turbo", "text_encoder/*.safetensors"),
-    ("Tongyi-MAI/Z-Image-Turbo", "vae/diffusion_pytorch_model.safetensors"),
-]
 Z_IMAGE_TOKENIZER = ("Tongyi-MAI/Z-Image-Turbo", "tokenizer/")
 
 
 def load_generation_pipeline(device: str) -> ZImagePipeline:
     print("Loading Z-Image generation pipeline (auto-downloads on first run)...")
+    # The transformer must use vram_config so AutoWrappedLinear is enabled.
+    # Without it, positive_only_lora is permanently fused into weights on every
+    # denoising step and cannot be cleared, accumulating 50× the LoRA delta.
+    vram_config = {
+        "offload_dtype": torch.bfloat16,
+        "offload_device": device,
+        "onload_dtype": torch.bfloat16,
+        "onload_device": device,
+        "preparing_dtype": torch.bfloat16,
+        "preparing_device": device,
+        "computation_dtype": torch.bfloat16,
+        "computation_device": device,
+    }
     model_configs = [
-        ModelConfig(model_id=mid, origin_file_pattern=pat)
-        for mid, pat in Z_IMAGE_MODELS
+        ModelConfig(model_id="Tongyi-MAI/Z-Image",       origin_file_pattern="transformer/*.safetensors", **vram_config),
+        ModelConfig(model_id="Tongyi-MAI/Z-Image-Turbo", origin_file_pattern="text_encoder/*.safetensors"),
+        ModelConfig(model_id="Tongyi-MAI/Z-Image-Turbo", origin_file_pattern="vae/diffusion_pytorch_model.safetensors"),
     ]
     tok_mid, tok_pat = Z_IMAGE_TOKENIZER
     return ZImagePipeline.from_pretrained(
