@@ -12,9 +12,67 @@ from .paths import checkpoints_dir, data_dir
 from .student import BACKBONE_CONFIGS, StudentImageEncoder, TEACHER_EMBEDDING_DIM
 from .dataset import TeacherEmbeddingDataset
 
+from torch.utils.data import random_split
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torchvision.transforms import RandomResizedCrop, ColorJitter, RandomHorizontalFlip, Compose
+
 DEFAULT_BACKBONE = "mobilenet_v3_small"
 DEFAULT_EPOCHS = 10
 DEFAULT_LEARNING_RATE = 1e-3
+
+
+def _build_augmentation():
+    """Build augmentation transform pipeline."""
+    return Compose([
+        RandomResizedCrop(224, scale=(0.5, 1.0), antialias=True),
+        RandomHorizontalFlip(p=0.5),
+    ])
+
+
+def _apply_augmentation(images):
+    """Apply augmentation to a batch of images [N, C, H, W]."""
+    transform = _build_augmentation()
+    augmented = []
+    for img in images:
+        aug = transform(img)
+        augmented.append(aug)
+    return torch.stack(augmented)
+
+
+def _split_dataset(dataset, val_fraction=0.1):
+    """Split dataset into train and validation sets."""
+    val_size = max(1, int(len(dataset) * val_fraction))
+    train_size = len(dataset) - val_size
+    return random_split(dataset, [train_size, val_size])
+
+
+def _set_backbone_trainable(model, trainable):
+    for p in model.encoder.parameters():
+        p.requires_grad_(trainable)
+
+
+def _validate_head(model, features, targets, device):
+    model.head.eval()
+    total = 0.0
+    with torch.no_grad():
+        for i in range(len(features)):
+            pred = model.head(features[i].to(device))
+            total += float(distillation_loss(pred, targets[i].to(device)))
+    return total / len(features)
+
+
+def _validate_full(model, dataset, device):
+    model.eval()
+    total = 0.0
+    with torch.no_grad():
+        for sample in dataset:
+            images = sample["images"].to(device)
+            target = sample["target"].to(device)
+            pred = model(images)
+            total += float(distillation_loss(pred, target))
+    return total / len(dataset)
+
+
 MANIFEST_FILENAME = "student_manifest.json"
 
 
@@ -42,6 +100,20 @@ def train_step(model: nn.Module, optimizer: torch.optim.Optimizer, images: torch
     return float(loss.item())
 
 
+def _embedding_dim_for_head(head: nn.Module) -> int:
+    if isinstance(head, nn.Sequential):
+        last = head[-1]
+        if isinstance(last, nn.Linear):
+            return last.out_features
+    if isinstance(head, nn.Linear):
+        return head.out_features
+    raise TypeError(f"Unsupported head type: {type(head)!r}")
+
+
+def _is_legacy_linear_head_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
+    return "head.weight" in state_dict and "head.bias" in state_dict and "head.0.weight" not in state_dict
+
+
 def save_checkpoint(model: StudentImageEncoder, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,7 +121,7 @@ def save_checkpoint(model: StudentImageEncoder, path: Path) -> None:
         {
             "state_dict": model.state_dict(),
             "backbone_name": model.backbone_name,
-            "embedding_dim": model.head[-1].out_features,
+            "embedding_dim": _embedding_dim_for_head(model.head),
         },
         path,
     )
@@ -61,7 +133,10 @@ def load_checkpoint(path: Path) -> StudentImageEncoder:
         backbone=checkpoint["backbone_name"],
         embedding_dim=int(checkpoint["embedding_dim"]),
     )
-    model.load_state_dict(checkpoint["state_dict"])
+    state_dict = checkpoint["state_dict"]
+    if _is_legacy_linear_head_state_dict(state_dict):
+        model.head = nn.Linear(model.encoder.out_dim, int(checkpoint["embedding_dim"]))
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     return model
 
@@ -89,49 +164,120 @@ def _cache_backbone_features(model: StudentImageEncoder, dataset: Dataset, devic
 
 
 def _train_model(
-    dataset: Dataset,
-    backbone: str,
-    epochs: int,
-    lr: float,
-) -> StudentImageEncoder:
+    dataset,
+    backbone,
+    epochs,
+    lr,
+    *,
+    val_fraction=0.1,
+    augment=False,
+    phase1_epochs=30,
+    phase2_epochs=20,
+    phase3_epochs=10,
+):
+    from torch.utils.data import DataLoader
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"backbone={backbone}  device={device}  samples={len(dataset)}  epochs={epochs}  lr={lr}")
 
+    train_ds, val_ds = _split_dataset(dataset, val_fraction)
+    print(f"train={len(train_ds)}  val={len(val_ds)}")
+
     model = StudentImageEncoder(backbone=backbone).to(device)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"params: {trainable:,} trainable / {total:,} total")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"params: {trainable:,} trainable / {total_params:,} total")
 
-    optimizer = torch.optim.Adam(
-        (p for p in model.parameters() if p.requires_grad), lr=lr
-    )
+    best_val_loss = float("inf")
 
-    # For frozen backbones, pre-compute features once and train only the head.
-    if _is_frozen_backbone(backbone):
-        features, targets = _cache_backbone_features(model, dataset, device)
-        for epoch in range(epochs):
-            model.train()
+    # --- Phase 1: Head-only with feature caching ---
+    if phase1_epochs > 0:
+        print("\n=== Phase 1: Head-only training (frozen backbones) ===")
+        features, targets = _cache_backbone_features(model, train_ds, device)
+        val_features, val_targets = _cache_backbone_features(model, val_ds, device)
+
+        optimizer = torch.optim.Adam(model.head.parameters(), lr=lr)
+        scheduler = CosineAnnealingLR(optimizer, T_max=phase1_epochs)
+
+        for epoch in range(phase1_epochs):
+            model.head.train()
             perm = torch.randperm(len(features))
             total_loss = 0.0
-            for i, idx in enumerate(perm):
+            for idx in perm:
                 feat = features[idx].to(device)
                 target = targets[idx].to(device)
                 optimizer.zero_grad()
-                prediction = model.head(feat)
-                loss = distillation_loss(prediction, target)
+                loss = distillation_loss(model.head(feat), target)
                 loss.backward()
                 optimizer.step()
                 total_loss += float(loss.item())
-            print(f"epoch {epoch + 1}/{epochs} done  avg_loss {total_loss / len(features):.4f}")
-    else:
-        for epoch in range(epochs):
+            scheduler.step()
+            val_loss = _validate_head(model, val_features, val_targets, device)
+            print(f"  epoch {epoch+1}/{phase1_epochs}  train_loss={total_loss/len(features):.4f}  val_loss={val_loss:.4f}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+
+    # --- Phase 2: Full model fine-tuning ---
+    if phase2_epochs > 0:
+        print("\n=== Phase 2: Full model fine-tuning ===")
+        _set_backbone_trainable(model, True)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"trainable params: {trainable:,}")
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=lr * 0.1, weight_decay=1e-4
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=phase2_epochs)
+        loader = DataLoader(train_ds, batch_size=2, shuffle=True)
+
+        for epoch in range(phase2_epochs):
+            model.train()
             total_loss = 0.0
-            for i, sample in enumerate(dataset):
-                loss = train_step(model, optimizer, sample["images"], sample["target"])
-                total_loss += loss
-                if (i + 1) % 100 == 0:
-                    print(f"  epoch {epoch + 1}/{epochs}  step {i + 1}/{len(dataset)}  avg_loss {total_loss / (i + 1):.4f}")
-            print(f"epoch {epoch + 1}/{epochs} done  avg_loss {total_loss / len(dataset):.4f}")
+            for batch in loader:
+                images = batch["images"].to(device)
+                target = batch["target"].to(device)
+                optimizer.zero_grad()
+                prediction = model(images)
+                loss = distillation_loss(prediction, target)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                total_loss += float(loss.item())
+            scheduler.step()
+            val_loss = _validate_full(model, val_ds, device)
+            print(f"  epoch {epoch+1}/{phase2_epochs}  train_loss={total_loss/len(loader):.4f}  val_loss={val_loss:.4f}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(model, Path("checkpoints") / checkpoint_path_for(backbone, Path("checkpoints")))
+
+    # --- Phase 3: Heavy augmentation polish ---
+    if phase3_epochs > 0:
+        print("\n=== Phase 3: Heavy augmentation ===")
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr * 0.01, weight_decay=1e-4)
+        scheduler = CosineAnnealingLR(optimizer, T_max=phase3_epochs)
+        loader = DataLoader(train_ds, batch_size=2, shuffle=True)
+
+        for epoch in range(phase3_epochs):
+            model.train()
+            total_loss = 0.0
+            for batch in loader:
+                images = batch["images"].to(device)
+                target = batch["target"].to(device)
+                if augment and images.dim() >= 4:
+                    images = _apply_augmentation(images)
+                optimizer.zero_grad()
+                prediction = model(images)
+                loss = distillation_loss(prediction, target)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                total_loss += float(loss.item())
+            scheduler.step()
+            val_loss = _validate_full(model, val_ds, device)
+            print(f"  epoch {epoch+1}/{phase3_epochs}  train_loss={total_loss/len(loader):.4f}  val_loss={val_loss:.4f}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(model, Path("checkpoints") / checkpoint_path_for(backbone, Path("checkpoints")))
 
     return model
 
@@ -156,6 +302,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_LEARNING_RATE,
         help=f"Learning rate. Default: {DEFAULT_LEARNING_RATE}",
     )
+    parser.add_argument("--val-fraction", type=float, default=0.1,
+                        help="Fraction of data for validation. Default: 0.1")
+    parser.add_argument("--augment", action="store_true", default=False,
+                        help="Enable data augmentation.")
+    parser.add_argument("--phase1-epochs", type=int, default=30,
+                        help="Phase 1 (head-only) epochs. Default: 30")
+    parser.add_argument("--phase2-epochs", type=int, default=20,
+                        help="Phase 2 (full model) epochs. Default: 20")
+    parser.add_argument("--phase3-epochs", type=int, default=10,
+                        help="Phase 3 (augmented) epochs. Default: 10")
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -181,7 +337,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Loading dataset from {training_data_path}")
     dataset = TeacherEmbeddingDataset(training_data_path)
 
-    model = _train_model(dataset, backbone=args.backbone, epochs=args.epochs, lr=args.lr)
+    trained = _train_model(
+        dataset, args.backbone, args.epochs, args.lr,
+        val_fraction=args.val_fraction,
+        augment=args.augment,
+        phase1_epochs=args.phase1_epochs,
+        phase2_epochs=args.phase2_epochs,
+        phase3_epochs=args.phase3_epochs,
+    )
+    model = trained
 
     ckpt_path = checkpoint_path_for(args.backbone, output_dir)
     save_checkpoint(model, ckpt_path)
@@ -189,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = {
         "backbone_name": args.backbone,
-        "embedding_dim": model.head[-1].out_features,
+        "embedding_dim": _embedding_dim_for_head(model.head),
         "training_data_path": str(training_data_path),
         "epochs": args.epochs,
         "lr": args.lr,
