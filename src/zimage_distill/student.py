@@ -10,6 +10,8 @@ _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD  = [0.229, 0.224, 0.225]
 _SIGLIP_MEAN   = [0.5, 0.5, 0.5]
 _SIGLIP_STD    = [0.5, 0.5, 0.5]
+_SIGLIP_L_MEAN = [0.5, 0.5, 0.5]
+_SIGLIP_L_STD  = [0.5, 0.5, 0.5]
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +143,18 @@ BACKBONE_CONFIGS: dict[str, dict] = {
             "freeze": True,
         },
     },
+    "dual-dinov3b-siglip2l": {
+        "cls": _DualHFViTBackbone,
+        "kwargs": {
+            "model_id_a":   "facebook/dinov3-vitb16-pretrain-lvd1689m",
+            "model_id_b":   "google/siglip2-large-patch16-256",
+            "norm_mean_a":  _IMAGENET_MEAN,
+            "norm_std_a":   _IMAGENET_STD,
+            "norm_mean_b":  _SIGLIP_L_MEAN,
+            "norm_std_b":   _SIGLIP_L_STD,
+            "freeze": True,
+        },
+    },
 }
 
 
@@ -152,6 +166,30 @@ def _build_backbone(name: str) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
+# Residual MLP head
+# ---------------------------------------------------------------------------
+
+class _ResidualBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.linear = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.dropout(self.linear(torch.nn.functional.gelu(self.norm(x))))
+
+
+def _build_residual_head(in_dim: int, out_dim: int, hidden_dim: int = 4096, depth: int = 4, dropout: float = 0.1) -> nn.Sequential:
+    layers: list[nn.Module] = [nn.Linear(in_dim, hidden_dim)]
+    for _ in range(depth):
+        layers.append(_ResidualBlock(hidden_dim, dropout))
+    layers.append(nn.LayerNorm(hidden_dim))
+    layers.append(nn.Linear(hidden_dim, out_dim))
+    return nn.Sequential(*layers)
+
+
+# ---------------------------------------------------------------------------
 # Student model
 # ---------------------------------------------------------------------------
 
@@ -160,12 +198,7 @@ class StudentImageEncoder(nn.Module):
         super().__init__()
         self.backbone_name = backbone
         self.encoder = _build_backbone(backbone)
-        hidden = max(self.encoder.out_dim * 2, 2048)
-        self.head = nn.Sequential(
-            nn.Linear(self.encoder.out_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, embedding_dim),
-        )
+        self.head = _build_residual_head(self.encoder.out_dim, embedding_dim)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         if images.dim() == 4:
