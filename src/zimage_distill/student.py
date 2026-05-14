@@ -35,14 +35,16 @@ class _MobileNetBackbone(nn.Module):
 
 def _load_vision_model(model_id: str):
     from transformers import AutoModel
+    import os as _os
+    _token = _os.environ.get("HF_TOKEN")
     # SigLIP models: AutoModel returns the full text+vision SiglipModel,
     # whose .vision_model attr is SiglipVisionTransformer (raw transformer
     # without model wrapper) which silently ignores output_hidden_states=True.
     # Load SiglipVisionModel directly so hidden_states are produced.
     if "siglip" in model_id.lower():
         from transformers import SiglipVisionModel
-        return SiglipVisionModel.from_pretrained(model_id)
-    model = AutoModel.from_pretrained(model_id)
+        return SiglipVisionModel.from_pretrained(model_id, token=_token)
+    model = AutoModel.from_pretrained(model_id, token=_token)
     if hasattr(model, "vision_model"):
         model = model.vision_model
     return model
