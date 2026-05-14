@@ -13,7 +13,7 @@ from torchvision.transforms.functional import resize, to_tensor
 from .i2l_adapter import I2LDecoderAdapter
 from .train import load_checkpoint
 
-IMAGE_SIZE = 224
+IMAGE_SIZE = 256
 
 
 def load_reference_images(image_paths: Sequence[Path | str]) -> torch.Tensor:

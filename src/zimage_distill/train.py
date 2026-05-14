@@ -24,7 +24,7 @@ DEFAULT_LEARNING_RATE = 1e-3
 def _build_augmentation():
     """Build augmentation transform pipeline."""
     return Compose([
-        RandomResizedCrop(224, scale=(0.5, 1.0), antialias=True),
+        RandomResizedCrop(256, scale=(0.5, 1.0), antialias=True),
         RandomHorizontalFlip(p=0.5),
     ])
 
@@ -85,6 +85,102 @@ def distillation_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.T
     cos_loss = (1 - torch.nn.functional.cosine_similarity(prediction, target, dim=-1)).mean()
     mse_loss = torch.nn.functional.mse_loss(prediction, target)
     return cos_loss + 0.1 * mse_loss
+
+
+def contrastive_loss(predictions: torch.Tensor, targets: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+    """InfoNCE loss encouraging each prediction to be closest to its own target.
+
+    Returns 0 for batch_size < 2 (no meaningful negatives).
+    """
+    if predictions.shape[0] < 2:
+        return predictions.new_tensor(0.0)
+    pred_norm = torch.nn.functional.normalize(predictions, dim=-1)
+    target_norm = torch.nn.functional.normalize(targets, dim=-1)
+    logits = (pred_norm @ target_norm.T) / temperature
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    return torch.nn.functional.cross_entropy(logits, labels)
+
+
+_clip_model_cache: dict[str, object] = {}
+
+
+def _get_clip_model(device: str = "cpu") -> object:
+    """Load CLIP ViT-L/14 once and cache it."""
+    if "clip" not in _clip_model_cache:
+        from transformers import CLIPModel, CLIPProcessor
+        model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device).eval()
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        for p in model.parameters():
+            p.requires_grad_(False)
+        _clip_model_cache["clip"] = (model, processor)
+    return _clip_model_cache["clip"]
+
+
+def clip_embed_images(images: torch.Tensor, device: str = "cpu") -> torch.Tensor:
+    """Get CLIP image embeddings for a batch of images [B, 3, H, W]."""
+    clip_model, processor = _get_clip_model(device)
+    # Convert tensor images back to PIL for CLIP processor
+    from PIL import Image
+    from torchvision.transforms.functional import to_pil_image
+    pil_images = [to_pil_image(img.cpu()) for img in images]
+    inputs = processor(images=pil_images, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = clip_model.get_image_features(**inputs)  # [B, 768]
+    return outputs
+
+
+def clip_perceptual_loss(predictions: torch.Tensor, clip_targets: torch.Tensor) -> torch.Tensor:
+    """Cosine distance between projected student embeddings and CLIP image features.
+
+    predictions: [B, 5632] — student embedding
+    clip_targets: [B, 768] — CLIP image features of reference images
+    """
+    # The clip_proj on the student model projects 5632 → 768
+    return (1 - torch.nn.functional.cosine_similarity(predictions, clip_targets, dim=-1)).mean()
+
+
+_teacher_bundle_cache: object | None = None
+
+
+def _get_teacher_bundle(device: str = "cuda", torch_dtype: torch.dtype = torch.bfloat16) -> object:
+    """Load the real teacher encoders (SigLIP2-G384 + DINOv3-7B) for live supervision.
+
+    Models are staged one at a time on GPU via CPU offloading, so they fit in 32GB.
+    """
+    global _teacher_bundle_cache
+    if _teacher_bundle_cache is None:
+        from .teacher_pairs import load_teacher_encoder_bundle, build_teacher_model_configs
+        from diffsynth.diffusion.base_pipeline import BasePipeline
+        from pathlib import Path
+        loader = BasePipeline(device="cpu", torch_dtype=torch_dtype)
+        configs = build_teacher_model_configs(
+            siglip2_path=Path("/dev/null"),  # force HF download
+            dinov3_path=Path("/dev/null"),
+        )
+        # Override to use HF download
+        for cfg in configs:
+            cfg.path = None
+        model_pool = loader.download_and_load_models(configs)
+        siglip = model_pool.fetch_model("siglip2_image_encoder")
+        dino = model_pool.fetch_model("dinov3_image_encoder")
+        from .teacher_pairs import TeacherEncoderBundle, ImageCropAndResize
+        _teacher_bundle_cache = TeacherEncoderBundle(
+            siglip2_image_encoder=siglip,
+            dinov3_image_encoder=dino,
+            device=device,
+            torch_dtype=torch_dtype,
+            preprocess=ImageCropAndResize(height=1024, width=1024),
+        )
+    return _teacher_bundle_cache
+
+
+def _compute_teacher_embedding(images: torch.Tensor, device: str = "cuda") -> torch.Tensor:
+    """Run the real teacher encoder to get a fresh teacher embedding."""
+    bundle = _get_teacher_bundle(device)
+    from PIL import Image
+    from torchvision.transforms.functional import to_pil_image
+    pil_images = [to_pil_image(img.cpu()) for img in images]
+    return bundle.encode_images(pil_images).mean(dim=0)  # [5632]
 
 
 def train_step(model: nn.Module, optimizer: torch.optim.Optimizer, images: torch.Tensor, target: torch.Tensor) -> float:
@@ -169,11 +265,17 @@ def _train_model(
     epochs,
     lr,
     *,
+    output_dir: Path,
     val_fraction=0.1,
     augment=False,
     phase1_epochs=30,
     phase2_epochs=20,
     phase3_epochs=10,
+    head_hidden_dim=None,
+    head_depth=None,
+    clip_loss=False,
+    resume_checkpoint=None,
+    live_teacher=False,
 ):
     from torch.utils.data import DataLoader
 
@@ -183,7 +285,14 @@ def _train_model(
     train_ds, val_ds = _split_dataset(dataset, val_fraction)
     print(f"train={len(train_ds)}  val={len(val_ds)}")
 
-    model = StudentImageEncoder(backbone=backbone).to(device)
+    if resume_checkpoint is not None:
+        print(f"Resuming from {resume_checkpoint}")
+        model = load_checkpoint(resume_checkpoint).to(device)
+        if clip_loss and model.clip_proj is None:
+            model.clip_proj = nn.Linear(5632, 768).to(device)
+    else:
+        clip_proj_dim = 768 if clip_loss else 0
+        model = StudentImageEncoder(backbone=backbone, head_hidden_dim=head_hidden_dim, head_depth=head_depth, clip_proj_dim=clip_proj_dim).to(device)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"params: {trainable:,} trainable / {total_params:,} total")
@@ -195,6 +304,7 @@ def _train_model(
         print("\n=== Phase 1: Head-only training (frozen backbones) ===")
         features, targets = _cache_backbone_features(model, train_ds, device)
         val_features, val_targets = _cache_backbone_features(model, val_ds, device)
+        contrastive_batch = 32  # minibatch size for contrastive loss
 
         optimizer = torch.optim.Adam(model.head.parameters(), lr=lr)
         scheduler = CosineAnnealingLR(optimizer, T_max=phase1_epochs)
@@ -203,17 +313,22 @@ def _train_model(
             model.head.train()
             perm = torch.randperm(len(features))
             total_loss = 0.0
-            for idx in perm:
-                feat = features[idx].to(device)
-                target = targets[idx].to(device)
+            n = len(features)
+            for start in range(0, n, contrastive_batch):
+                batch_idx = perm[start:start + contrastive_batch]
+                feats_batch = features[batch_idx].to(device)
+                targs_batch = targets[batch_idx].to(device)
+                preds_batch = model.head(feats_batch)
                 optimizer.zero_grad()
-                loss = distillation_loss(model.head(feat), target)
+                # Per-sample distillation + batch-level contrastive
+                loss = distillation_loss(preds_batch, targs_batch) + 0.1 * contrastive_loss(preds_batch, targs_batch)
                 loss.backward()
                 optimizer.step()
-                total_loss += float(loss.item())
+                total_loss += float(loss.item()) * len(batch_idx)
+            total_loss /= n
             scheduler.step()
             val_loss = _validate_head(model, val_features, val_targets, device)
-            print(f"  epoch {epoch+1}/{phase1_epochs}  train_loss={total_loss/len(features):.4f}  val_loss={val_loss:.4f}")
+            print(f"  epoch {epoch+1}/{phase1_epochs}  train_loss={total_loss:.4f}  val_loss={val_loss:.4f}")
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
 
@@ -228,17 +343,24 @@ def _train_model(
             model.parameters(), lr=lr * 0.1, weight_decay=1e-4
         )
         scheduler = CosineAnnealingLR(optimizer, T_max=phase2_epochs)
-        loader = DataLoader(train_ds, batch_size=2, shuffle=True)
+        loader = DataLoader(train_ds, batch_size=1, shuffle=True)
 
+        use_clip = getattr(model, "clip_proj", None) is not None
+        clip_step_interval = max(1, len(loader) // 20)  # CLIP loss every ~5% of batches
         for epoch in range(phase2_epochs):
             model.train()
             total_loss = 0.0
-            for batch in loader:
+            for step, batch in enumerate(loader):
                 images = batch["images"].to(device)
-                target = batch["target"].to(device)
+                target = batch["target"].to(device).squeeze(0)
                 optimizer.zero_grad()
                 prediction = model(images)
                 loss = distillation_loss(prediction, target)
+                # Add CLIP perceptual loss periodically (expensive: runs CLIP on reference images)
+                if use_clip and step % clip_step_interval == 0:
+                    clip_feats = clip_embed_images(images.squeeze(0) if images.dim() > 4 else images, device)
+                    clip_pred = model.clip_proj(prediction.unsqueeze(0) if prediction.dim() == 1 else prediction)
+                    loss = loss + 0.1 * clip_perceptual_loss(clip_pred, clip_feats)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -248,26 +370,33 @@ def _train_model(
             print(f"  epoch {epoch+1}/{phase2_epochs}  train_loss={total_loss/len(loader):.4f}  val_loss={val_loss:.4f}")
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                save_checkpoint(model, Path("checkpoints") / checkpoint_path_for(backbone, Path("checkpoints")))
+                save_checkpoint(model, checkpoint_path_for(backbone, output_dir))
 
     # --- Phase 3: Heavy augmentation polish ---
     if phase3_epochs > 0:
         print("\n=== Phase 3: Heavy augmentation ===")
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr * 0.01, weight_decay=1e-4)
         scheduler = CosineAnnealingLR(optimizer, T_max=phase3_epochs)
-        loader = DataLoader(train_ds, batch_size=2, shuffle=True)
+        loader = DataLoader(train_ds, batch_size=1, shuffle=True)
 
         for epoch in range(phase3_epochs):
             model.train()
             total_loss = 0.0
             for batch in loader:
                 images = batch["images"].to(device)
-                target = batch["target"].to(device)
+                target = batch["target"].to(device).squeeze(0)
                 if augment and images.dim() >= 4:
                     images = _apply_augmentation(images)
+                    if live_teacher:
+                        target = _compute_teacher_embedding(images.squeeze(0) if images.dim() > 4 else images, device)
                 optimizer.zero_grad()
                 prediction = model(images)
                 loss = distillation_loss(prediction, target)
+                # CLIP loss on live-teacher batches too
+                if use_clip and live_teacher:
+                    clip_feats = clip_embed_images(images.squeeze(0) if images.dim() > 4 else images, device)
+                    clip_pred = model.clip_proj(prediction.unsqueeze(0) if prediction.dim() == 1 else prediction)
+                    loss = loss + 0.1 * clip_perceptual_loss(clip_pred, clip_feats)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -277,7 +406,7 @@ def _train_model(
             print(f"  epoch {epoch+1}/{phase3_epochs}  train_loss={total_loss/len(loader):.4f}  val_loss={val_loss:.4f}")
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                save_checkpoint(model, Path("checkpoints") / checkpoint_path_for(backbone, Path("checkpoints")))
+                save_checkpoint(model, checkpoint_path_for(backbone, output_dir))
 
     return model
 
@@ -312,6 +441,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Phase 2 (full model) epochs. Default: 20")
     parser.add_argument("--phase3-epochs", type=int, default=10,
                         help="Phase 3 (augmented) epochs. Default: 10")
+    parser.add_argument("--head-hidden-dim", type=int, default=None,
+                        help="Override head hidden dim. Default: from backbone config")
+    parser.add_argument("--head-depth", type=int, default=None,
+                        help="Override head depth. Default: from backbone config")
+    parser.add_argument("--clip-loss", action="store_true", default=False,
+                        help="Enable CLIP perceptual loss (requires CLIP model, uses more VRAM).")
+    parser.add_argument("--resume-checkpoint", type=Path, default=None,
+                        help="Resume training from a saved checkpoint.")
+    parser.add_argument("--live-teacher", action="store_true", default=False,
+                        help="Use the real teacher encoder (DINOv3-7B + SigLIP2-G384) for live supervision on augmented images.")
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -339,11 +478,17 @@ def main(argv: list[str] | None = None) -> int:
 
     trained = _train_model(
         dataset, args.backbone, args.epochs, args.lr,
+        output_dir=output_dir,
         val_fraction=args.val_fraction,
         augment=args.augment,
         phase1_epochs=args.phase1_epochs,
         phase2_epochs=args.phase2_epochs,
         phase3_epochs=args.phase3_epochs,
+        head_hidden_dim=args.head_hidden_dim,
+        head_depth=args.head_depth,
+        clip_loss=args.clip_loss,
+        resume_checkpoint=args.resume_checkpoint,
+        live_teacher=args.live_teacher,
     )
     model = trained
 
