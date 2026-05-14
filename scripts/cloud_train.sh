@@ -67,8 +67,16 @@ echo "=== Installing dependencies ==="
 python -m venv venv
 source venv/bin/activate
 pip install --upgrade pip setuptools wheel
+
+# cu128 = CUDA 12.8, required for RTX 5090 Blackwell (SM 12.0).
+# NOTE: ENVIRONMENT.md uses cu118 but that is for the RTX 4090 (Ada Lovelace,
+# SM 8.9). CUDA 11.8 has no Blackwell kernels — the 5090 won't work with it.
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install transformers safetensors huggingface_hub modelscope pillow
+pip install "transformers>=4.46,<5.0" safetensors huggingface_hub modelscope pillow
+
+# DiffSynth-Studio vendored fork (needed for live-teacher Phase 3)
+git submodule update --init vendor/DiffSynth-Studio
+pip install -e vendor/DiffSynth-Studio
 pip install -e .
 
 # ---- Verify GPU ----
