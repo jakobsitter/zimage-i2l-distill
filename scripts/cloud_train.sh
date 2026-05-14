@@ -22,7 +22,7 @@ CKPT="checkpoints/student_dual-dinov3l-siglip2l.pt"
 DATA_DIR="data/teacher_pairs"
 OUTPUT_DIR="checkpoints"
 MIN_GPU_MB=24000
-MIN_DISK_GB=30
+MIN_DISK_GB=10
 
 # ---- Preflight ----
 echo "=== Preflight checks ==="
@@ -43,7 +43,7 @@ if [ ! -d "dataset_master_clean" ]; then
     echo "  Or extract from archive on the server: tar -xzf dataset_master_clean.tar.gz"
     exit 1
 fi
-ref_img_count=$(find dataset_master_clean -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" \) | wc -l)
+ref_img_count=$(find -L dataset_master_clean -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" \) | wc -l)
 echo "  Reference images: dataset_master_clean/ ($ref_img_count files)"
 
 # Disk space

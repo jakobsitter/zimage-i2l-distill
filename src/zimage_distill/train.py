@@ -94,6 +94,7 @@ def contrastive_loss(predictions: torch.Tensor, targets: torch.Tensor, temperatu
     """
     if predictions.shape[0] < 2:
         return predictions.new_tensor(0.0)
+    targets = targets.to(predictions)
     pred_norm = torch.nn.functional.normalize(predictions, dim=-1)
     target_norm = torch.nn.functional.normalize(targets, dim=-1)
     logits = (pred_norm @ target_norm.T) / temperature
@@ -135,7 +136,7 @@ def clip_perceptual_loss(predictions: torch.Tensor, clip_targets: torch.Tensor) 
     predictions: [B, 5632] — student embedding
     clip_targets: [B, 768] — CLIP image features of reference images
     """
-    # The clip_proj on the student model projects 5632 → 768
+    clip_targets = clip_targets.to(predictions)
     return (1 - torch.nn.functional.cosine_similarity(predictions, clip_targets, dim=-1)).mean()
 
 
@@ -153,13 +154,14 @@ def _get_teacher_bundle(device: str = "cuda", torch_dtype: torch.dtype = torch.b
         from diffsynth.diffusion.base_pipeline import BasePipeline
         from pathlib import Path
         loader = BasePipeline(device="cpu", torch_dtype=torch_dtype)
+        import os as _os
+        _os.environ.setdefault("DIFFSYNTH_MODEL_BASE_PATH", "/root/autodl-tmp/models")
         configs = build_teacher_model_configs(
-            siglip2_path=Path("/dev/null"),  # force HF download
-            dinov3_path=Path("/dev/null"),
+            siglip2_path=Path("/nonexistent"),  # force download
+            dinov3_path=Path("/nonexistent"),
         )
-        # Override to use HF download
         for cfg in configs:
-            cfg.path = None
+            cfg.download_source = "huggingface"  # HF CDN is faster than ModelScope
         model_pool = loader.download_and_load_models(configs)
         siglip = model_pool.fetch_model("siglip2_image_encoder")
         dino = model_pool.fetch_model("dinov3_image_encoder")
@@ -251,8 +253,8 @@ def _cache_backbone_features(model: StudentImageEncoder, dataset: Dataset, devic
         for i, sample in enumerate(dataset):
             images = sample["images"].to(device)
             features = model.encoder(images.unsqueeze(0) if images.dim() == 3 else images)
-            all_features.append(features.mean(dim=0).cpu())
-            all_targets.append(sample["target"].cpu())
+            all_features.append(features.mean(dim=0).cpu().float())
+            all_targets.append(sample["target"].cpu().float())
             if (i + 1) % 100 == 0:
                 print(f"  cached {i + 1}/{len(dataset)}")
     print(f"Feature cache ready: {len(all_features)} samples")
@@ -297,6 +299,8 @@ def _train_model(
     total_params = sum(p.numel() for p in model.parameters())
     print(f"params: {trainable:,} trainable / {total_params:,} total")
 
+    use_clip = getattr(model, "clip_proj", None) is not None
+
     best_val_loss = float("inf")
 
     # --- Phase 1: Head-only with feature caching ---
@@ -332,6 +336,10 @@ def _train_model(
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
 
+        ckpt = checkpoint_path_for(backbone, output_dir)
+        save_checkpoint(model, ckpt)
+        print(f"Phase 1 checkpoint saved: {ckpt}")
+
     # --- Phase 2: Full model fine-tuning ---
     if phase2_epochs > 0:
         print("\n=== Phase 2: Full model fine-tuning ===")
@@ -343,9 +351,8 @@ def _train_model(
             model.parameters(), lr=lr * 0.1, weight_decay=1e-4
         )
         scheduler = CosineAnnealingLR(optimizer, T_max=phase2_epochs)
-        loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+        loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=4)
 
-        use_clip = getattr(model, "clip_proj", None) is not None
         clip_step_interval = max(1, len(loader) // 20)  # CLIP loss every ~5% of batches
         for epoch in range(phase2_epochs):
             model.train()
@@ -372,17 +379,21 @@ def _train_model(
                 best_val_loss = val_loss
                 save_checkpoint(model, checkpoint_path_for(backbone, output_dir))
 
+        ckpt = checkpoint_path_for(backbone, output_dir)
+        save_checkpoint(model, ckpt)
+        print(f"Phase 2 checkpoint saved: {ckpt}")
+
     # --- Phase 3: Heavy augmentation polish ---
     if phase3_epochs > 0:
         print("\n=== Phase 3: Heavy augmentation ===")
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr * 0.01, weight_decay=1e-4)
         scheduler = CosineAnnealingLR(optimizer, T_max=phase3_epochs)
-        loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+        loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=4)
 
         for epoch in range(phase3_epochs):
             model.train()
             total_loss = 0.0
-            for batch in loader:
+            for step, batch in enumerate(loader):
                 images = batch["images"].to(device)
                 target = batch["target"].to(device).squeeze(0)
                 if augment and images.dim() >= 4:
@@ -401,6 +412,8 @@ def _train_model(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 total_loss += float(loss.item())
+                if (step + 1) % 50 == 0:
+                    print(f"    step {step+1}/{len(loader)}  loss={total_loss/(step+1):.4f}")
             scheduler.step()
             val_loss = _validate_full(model, val_ds, device)
             print(f"  epoch {epoch+1}/{phase3_epochs}  train_loss={total_loss/len(loader):.4f}  val_loss={val_loss:.4f}")

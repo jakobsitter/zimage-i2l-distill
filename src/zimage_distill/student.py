@@ -35,9 +35,14 @@ class _MobileNetBackbone(nn.Module):
 
 def _load_vision_model(model_id: str):
     from transformers import AutoModel
+    # SigLIP models: AutoModel returns the full text+vision SiglipModel,
+    # whose .vision_model attr is SiglipVisionTransformer (raw transformer
+    # without model wrapper) which silently ignores output_hidden_states=True.
+    # Load SiglipVisionModel directly so hidden_states are produced.
+    if "siglip" in model_id.lower():
+        from transformers import SiglipVisionModel
+        return SiglipVisionModel.from_pretrained(model_id)
     model = AutoModel.from_pretrained(model_id)
-    # Full vision-language models (e.g. SiglipModel) wrap the vision encoder
-    # under .vision_model; extract it so we get a clean vision-only module.
     if hasattr(model, "vision_model"):
         model = model.vision_model
     return model
@@ -65,7 +70,7 @@ class _HFViTBackbone(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x - self.mean.to(x)) / self.std.to(x)
-        return _pool(self.model(pixel_values=x))
+        return _pool(self.model(pixel_values=x, interpolate_pos_encoding=True))
 
 
 class _DualHFViTBackbone(nn.Module):
@@ -98,10 +103,10 @@ class _DualHFViTBackbone(nn.Module):
         xa = (x - self.mean_a.to(x)) / self.std_a.to(x)
         xb = (x - self.mean_b.to(x)) / self.std_b.to(x)
         if self.multi_scale:
-            return torch.cat([_multi_scale_pool(self.model_a(pixel_values=xa, output_hidden_states=True)),
-                              _multi_scale_pool(self.model_b(pixel_values=xb, output_hidden_states=True))], dim=-1)
-        return torch.cat([_pool(self.model_a(pixel_values=xa)),
-                          _pool(self.model_b(pixel_values=xb))], dim=-1)
+            return torch.cat([_multi_scale_pool(self.model_a(pixel_values=xa, output_hidden_states=True, interpolate_pos_encoding=True)),
+                              _multi_scale_pool(self.model_b(pixel_values=xb, output_hidden_states=True, interpolate_pos_encoding=True))], dim=-1)
+        return torch.cat([_pool(self.model_a(pixel_values=xa, interpolate_pos_encoding=True)),
+                          _pool(self.model_b(pixel_values=xb, interpolate_pos_encoding=True))], dim=-1)
 
 
 def _multi_scale_pool(outputs) -> torch.Tensor:
