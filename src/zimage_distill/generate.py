@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import torch
@@ -20,34 +21,82 @@ DEFAULT_NEGATIVE_PROMPT = (
 )
 
 Z_IMAGE_TOKENIZER = ("Tongyi-MAI/Z-Image-Turbo", "tokenizer/")
+COMFYUI_MODEL_ROOT_ENV = "ZIMAGE_COMFYUI_MODELS_DIR"
+DEFAULT_COMFYUI_MODEL_ROOT = Path("/home/jakob/comfy/ComfyUI/models")
+COMFYUI_MODEL_ROOT_ENV = "ZIMAGE_COMFYUI_MODELS_DIR"
+DEFAULT_COMFYUI_MODEL_ROOT = Path("/home/jakob/comfy/ComfyUI/models")
+
+
+def _normalize_cuda_device(device: str) -> str:
+    parsed = torch.device(device)
+    if parsed.type != "cuda":
+        return device
+    if parsed.index is None:
+        return "cuda:0"
+    return f"cuda:{parsed.index}"
+
+
+def _generation_vram_limit(device: str) -> float | None:
+    if torch.device(device).type != "cuda":
+        return None
+    return torch.cuda.mem_get_info()[1] / (1024 ** 3) - 0.5
+
+
+def _comfyui_model_root() -> Path | None:
+    candidate = Path(os.environ.get(COMFYUI_MODEL_ROOT_ENV, DEFAULT_COMFYUI_MODEL_ROOT))
+    required_files = [
+        candidate / "diffusion_models" / "z_image_turbo_bf16.safetensors",
+        candidate / "text_encoders" / "qwen_3_4b.safetensors",
+        candidate / "vae" / "z_ae.safetensors",
+    ]
+    if all(path.exists() for path in required_files):
+        return candidate
+    return None
+
+
+def _generation_model_configs(vram_config: dict[str, object]) -> list[ModelConfig]:
+    comfyui_root = _comfyui_model_root()
+    if comfyui_root is not None:
+        print(f"Using ComfyUI model files from {comfyui_root}")
+        return [
+            ModelConfig(path=str(comfyui_root / "diffusion_models" / "z_image_turbo_bf16.safetensors"), **vram_config),
+            ModelConfig(path=str(comfyui_root / "text_encoders" / "qwen_3_4b.safetensors"), **vram_config),
+            ModelConfig(path=str(comfyui_root / "vae" / "z_ae.safetensors"), **vram_config),
+        ]
+    return [
+        ModelConfig(model_id="Tongyi-MAI/Z-Image", origin_file_pattern="transformer/*.safetensors", **vram_config),
+        ModelConfig(model_id="Tongyi-MAI/Z-Image-Turbo", origin_file_pattern="text_encoder/*.safetensors", **vram_config),
+        ModelConfig(model_id="Tongyi-MAI/Z-Image-Turbo", origin_file_pattern="vae/diffusion_pytorch_model.safetensors", **vram_config),
+    ]
 
 
 def load_generation_pipeline(device: str) -> ZImagePipeline:
+    device = _normalize_cuda_device(device)
+    device_obj = torch.device(device)
     print("Loading Z-Image generation pipeline (auto-downloads on first run)...")
     # The transformer must use vram_config so AutoWrappedLinear is enabled.
     # Without it, positive_only_lora is permanently fused into weights on every
     # denoising step and cannot be cleared, accumulating 50× the LoRA delta.
+    # Use the documented low-VRAM path so the model constructor stays within
+    # 12 GB-class cards during load.
     vram_config = {
         "offload_dtype": torch.bfloat16,
-        "offload_device": device,
+        "offload_device": "cpu",
         "onload_dtype": torch.bfloat16,
-        "onload_device": device,
+        "onload_device": "cpu",
         "preparing_dtype": torch.bfloat16,
-        "preparing_device": device,
+        "preparing_device": device_obj,
         "computation_dtype": torch.bfloat16,
-        "computation_device": device,
+        "computation_device": device_obj,
     }
-    model_configs = [
-        ModelConfig(model_id="Tongyi-MAI/Z-Image",       origin_file_pattern="transformer/*.safetensors", **vram_config),
-        ModelConfig(model_id="Tongyi-MAI/Z-Image-Turbo", origin_file_pattern="text_encoder/*.safetensors"),
-        ModelConfig(model_id="Tongyi-MAI/Z-Image-Turbo", origin_file_pattern="vae/diffusion_pytorch_model.safetensors"),
-    ]
+    model_configs = _generation_model_configs(vram_config)
     tok_mid, tok_pat = Z_IMAGE_TOKENIZER
     return ZImagePipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
-        device=device,
+        device=device_obj,
         model_configs=model_configs,
         tokenizer_config=ModelConfig(model_id=tok_mid, origin_file_pattern=tok_pat),
+        vram_limit=_generation_vram_limit(device),
     )
 
 
@@ -57,6 +106,7 @@ def lora_from_checkpoint(
     reference_images: list[Path],
     device: str,
 ) -> dict[str, torch.Tensor]:
+    device = _normalize_cuda_device(device)
     student = load_checkpoint(student_checkpoint).to(device).eval()
     images = load_reference_images(reference_images).to(device)
     with torch.no_grad():
@@ -132,6 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    device = _normalize_cuda_device(args.device)
 
     if args.reference_images and args.student_checkpoint is None:
         build_parser().error("--student-checkpoint is required when using --reference-image")
@@ -148,14 +199,14 @@ def main(argv: list[str] | None = None) -> int:
             args.student_checkpoint,
             args.decoder_checkpoint,
             args.reference_images,
-            args.device,
+            device,
         )
 
     if lora is not None and args.lora_scale != 1.0:
         print(f"Applying lora-scale={args.lora_scale}")
         lora = {k: v * args.lora_scale for k, v in lora.items()}
 
-    pipe = load_generation_pipeline(args.device)
+    pipe = load_generation_pipeline(device)
 
     print(f"Generating: {args.prompt!r}")
     image = generate_image(

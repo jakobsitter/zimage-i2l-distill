@@ -10,4 +10,6 @@ if _vendor_path.is_dir():
 
 from .paths import checkpoints_dir, data_dir, repo_root
 
-__all__ = ["checkpoints_dir", "data_dir", "repo_root"]
+from .comfyui_style_payload_node import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+
+__all__ = ["checkpoints_dir", "data_dir", "repo_root", "NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

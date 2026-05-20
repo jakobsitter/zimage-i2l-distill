@@ -11,10 +11,12 @@ from torch.utils.data import Dataset
 from torchvision.transforms.functional import resize, to_tensor
 from torchvision.transforms import InterpolationMode
 
+from .paths import repo_root
+
 MANIFEST_FILENAME = "manifest.json"
 EMBEDDING_FILENAME = "teacher_embedding.safetensors"
 EMBEDDING_KEY = "teacher_embedding"
-IMAGE_SIZE = 224
+IMAGE_SIZE = 256
 
 
 class TeacherEmbeddingDataset(Dataset[dict[str, Any]]):
@@ -48,8 +50,22 @@ class TeacherEmbeddingDataset(Dataset[dict[str, Any]]):
         }
 
     def _load_image(self, sample_dir: Path, image_path: Path) -> torch.Tensor:
-        resolved_path = image_path if image_path.is_absolute() else sample_dir / image_path
+        resolved_path = self._resolve_image_path(sample_dir, image_path)
         with Image.open(resolved_path) as image:
             rgb_image = image.convert("RGB")
             resized = resize(rgb_image, [IMAGE_SIZE, IMAGE_SIZE], interpolation=InterpolationMode.BILINEAR, antialias=True)
             return to_tensor(resized)
+
+    def _resolve_image_path(self, sample_dir: Path, image_path: Path) -> Path:
+        if not image_path.is_absolute():
+            return sample_dir / image_path
+        if image_path.is_file():
+            return image_path
+
+        parts = image_path.parts
+        if "dataset_master_clean" in parts:
+            suffix = Path(*parts[parts.index("dataset_master_clean") + 1 :])
+            candidate = repo_root() / "dataset_master_clean" / suffix
+            if candidate.is_file():
+                return candidate
+        return image_path

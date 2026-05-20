@@ -12,6 +12,8 @@ requires-python = ">=3.10"
 zimage-distill-pairs = "zimage_distill.teacher_pairs:main"
 zimage-distill-infer = "zimage_distill.infer:main"
 zimage-distill-generate = "zimage_distill.generate:main"
+zimage-distill-direct-generate = "zimage_distill.direct_generate:main"
+zimage-distill-train-style-bridge = "zimage_distill.train_style_bridge:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
